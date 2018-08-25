@@ -24,7 +24,7 @@ for DEP in \
   quilt \
   rsync \
 ; do
-  dpkg -l "$DEP" >/dev/null 2>&1 || DEPS="$DEP $DEPS"
+  dpkg -l "$DEP" | grep -q '^ii' >/dev/null 2>&1 || DEPS="$DEP $DEPS"
 done
 [ "$DEPS" = "" ] || { sudo apt-get update && sudo apt-get install -y $DEPS; }
 
