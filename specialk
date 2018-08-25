@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -e
+
+[ -z "$SPK_TRACE" ] || set -x
+
+# Dependencies
+DEPS=""
+for DEP in \
+  bc \
+  bison \
+  cpio \
+  curl \
+  dh-exec \
+  dpkg-dev \
+  fakeroot \
+  flex \
+  g++-7 \
+  gcc-7 \
+  git \
+  kernel-wedge \
+  libssl-dev \
+  make \
+  python3 \
+  quilt \
+  rsync \
+; do
+  dpkg -l "$DEP" >/dev/null 2>&1 || DEPS="$DEP $DEPS"
+done
+[ "$DEPS" = "" ] || { sudo apt-get update && sudo apt-get install -y $DEPS; }
+
+# Paths
+SPK_BUILD="${SPK_BUILD:-"$PWD"}"
+SPK_PATCHES="${SPK_PATCHES:-"$PWD/patches"}"
+SPK_CONFIG="${SPK_CONFIG:-"$PWD/config"}"
+SPK_DEFINES="${SPK_DEFINES:-"$PWD/defines"}"
+
+# Kernel
+SPK_ARCH="${SPK_ARCH:-"$(dpkg-architecture -q DEB_BUILD_ARCH)"}"
+SPK_FSET="${SPK_FSET:-"none"}" # TODO: find current featureset?
+SPK_FLAV="${SPK_FLAV:-"spk"}"
+SPK_DESC="${SPK_DESC:-"special people"}"
+
+# Debian
+SPK_REPO="${SPK_REPO:-"https://salsa.debian.org/kernel-team/linux.git"}"
+SPK_TAG="${SPK_TAG:-"debian/$(uname -v | sed 's/.* \([^ ]*\) (.*/\1/')"}"
+SPK_MIRROR="${SPK_MIRROR:-"http://http.debian.net/debian"}"
+
+cd "$SPK_BUILD"
+
+# Clone
+[ -d linux ] || git clone --depth 1 -b "$SPK_TAG" "$SPK_REPO" linux 2>/dev/null
+
+# Versions
+ABIV=$(set -- linux/debian/abi/*-*; echo "$1" | cut -d/ -f4)
+HEAD=$(head -1 linux/debian/changelog)
+DREL=$(echo "$HEAD" | sed 's/.* \([^ ;]*\);.*/\1/')
+DVER=$(echo "$HEAD" | sed 's/.*(\([^)]*\).*/\1/')
+UVER=$(echo "$DVER" | cut -d- -f1)
+ORIG="linux_${UVER}.orig.tar.xz"
+
+# Source
+[ -f "$ORIG" ] || curl -sLO "$SPK_MIRROR/pool/main/l/linux/$ORIG"
+
+cd linux/debian
+
+# Unrelease
+[ "$DREL" = UNRELEASED ] || sed -i "s/$DVER) $DREL/$DVER) UNRELEASED/" changelog
+
+# Patches
+sed -i -n '/# specialk patches/q;p' patches/series
+echo -e '# specialk patches' >> patches/series
+mkdir -p patches/specialk
+[ ! -d "$SPK_PATCHES" ] || for PATCH in "$SPK_PATCHES"/*.patch; do
+  cp "$PATCH" patches/specialk
+  echo "specialk/$(basename $PATCH)" >> patches/series
+done
+
+# Config
+[ ! -f "$SPK_CONFIG" ] || cp "$SPK_CONFIG" "config/$SPK_ARCH/config.$SPK_FLAV"
+
+# Defines
+ADEF="config/$SPK_ARCH/defines"
+FDEF="config/$SPK_ARCH/$SPK_FSET/defines"
+[ -f "$FDEF" ] || FDEF="$ADEF"
+sed -i "/^ $SPK_FLAV\$/d" "$FDEF"
+sed -i "s/flavours:/flavours:\n $SPK_FLAV/" "$FDEF"
+sed -i -n '/# specialk defines/q;p' "$ADEF"
+cat >> "$ADEF" <<EOF
+# specialk defines
+[${SPK_FLAV}_image]
+[${SPK_FLAV}_description]
+hardware: $SPK_DESC
+EOF
+[ ! -f "$SPK_DEFINES" ] || cat "$SPK_DEFINES" >> "$ADEF"
+
+# Env
+export $(dpkg-architecture -a "$SPK_ARCH" 2>/dev/null)
+DEB_BUILD_PROFILES="nopython nodoc pkg.linux.notools"
+[ "$DEB_BUILD_ARCH" = "$DEB_HOST_ARCH" ] || DEB_BUILD_PROFILES="cross $DEB_BUILD_PROFILES"
+export DEB_BUILD_PROFILES
+[ ! -d /usr/lib/ccache ] || export PATH=/usr/lib/ccache:$PATH
+export MAKEFLAGS="-j$(($(nproc) * 2))"
+export DEBIAN_KERNEL_DISABLE_DEBUG=yes
+
+# Build
+cd ..
+fakeroot make -f debian/rules maintainerclean
+fakeroot make -f debian/rules debian/control || true # fails intentionally
+fakeroot make -f debian/rules clean
+fakeroot make -f debian/rules orig
+fakeroot make -f debian/rules source
+fakeroot make -f debian/rules.gen "setup_${SPK_ARCH}_${SPK_FSET}_${SPK_FLAV}"
+fakeroot make -f debian/rules.gen "binary-arch_${SPK_ARCH}_${SPK_FSET}_${SPK_FLAV}"
